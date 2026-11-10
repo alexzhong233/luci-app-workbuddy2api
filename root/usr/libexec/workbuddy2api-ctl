@@ -523,7 +523,10 @@ worker_python() {
 	set_phase "installing:$tag"
 	case "$mgr" in
 		apk)
-			apk add --allow-untrusted --force-overwrite "$f" 2>&1 || {
+			# 先删再装：重装/升级时留着旧包会撞文件冲突，而且 apk 不会
+			# 自动把旧版本的文件清干净。/etc/config 是 conffile，删包不会丢。
+			apk del workbuddy2api >/dev/null 2>&1
+			apk add --allow-untrusted "$f" 2>&1 || {
 				echo "== apk add 失败：看上面是不是缺依赖或源不通"
 				set_phase "error:apk add 失败，见上方输出"
 				rm -rf "$tmp"
@@ -531,6 +534,7 @@ worker_python() {
 			}
 			;;
 		opkg)
+			opkg remove workbuddy2api >/dev/null 2>&1
 			opkg install "$f" 2>&1 || {
 				set_phase "error:opkg install 失败，见上方输出"
 				rm -rf "$tmp"
