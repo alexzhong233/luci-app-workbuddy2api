@@ -1,0 +1,16 @@
+{
+	"luci-app-workbuddy2api": {
+		"description": "Install and control WorkBuddy2API (local python / local rust / docker variants)",
+		"read": {
+			"file": {
+				"/usr/libexec/workbuddy2api-ctl": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/workbuddy2api-ctl": [ "exec" ]
+			},
+			"uci": [ "workbuddy2api" ]
+		}
+	}
+}

@@ -1,0 +1,1151 @@
+#!/bin/sh
+# WorkBuddy2API 在 OpenWrt 上的四种安装方式，四选一。
+#
+#   本地·原版   python     官方 apk/ipk（纯 Python，带 python3 依赖）
+#   容器·原版   python-docker  ghcr.io/ardeyouxipianyi/workbuddy2api-hub
+#   本地·Rust   rust       wb-backend 静态 musl 单文件（YTjungle666 分支）
+#   容器·Rust   rust-docker    ghcr.io/ytjungle666/workbuddy2api-hub
+#
+# 四个版本共用同一个数据目录：$DATADIR/accounts（每账号一个 JSON）与
+# $DATADIR/usage（用量日志）。切换实现只换运行方式，账号和额度记录都不动。
+# 端口 8788、目录同一份，所以同一时刻只能跑一个，ctl 里硬拦。
+#
+# 两个上游：
+#   原版 ardeyouxipianyi/workbuddy2api-hub  —— Python，有 OpenWrt 包 + arm64 镜像
+#   Rust YTjungle666/workbuddy2api-hub      —— 单文件静态二进制，无 Python 运行时
+
+PY_REPO="ardeyouxipianyi/workbuddy2api-hub"
+RS_REPO="YTjungle666/workbuddy2api-hub"
+PY_IMG="ghcr.io/ardeyouxipianyi/workbuddy2api-hub"
+RS_IMG="ghcr.io/ytjungle666/workbuddy2api-hub"
+
+CT_NAME="wb-proxy"
+TASK_DIR="/var/run/workbuddy2api-task"
+RUST_BIN="/usr/bin/wb-backend"
+PY_INIT="/etc/init.d/workbuddy2api"
+RS_INIT="/etc/init.d/workbuddy2api-rust"
+DIR_DEFAULT="/mnt/sda1/Configs/workbuddy2api"
+PORT_DEFAULT="8788"
+
+VARIANT=""
+DATADIR=$(uci -q get workbuddy2api.main.datadir)
+[ -n "$DATADIR" ] || DATADIR="$DIR_DEFAULT"
+PORT=$(uci -q get workbuddy2api.main.port)
+[ -n "$PORT" ] || PORT="$PORT_DEFAULT"
+
+ACCOUNTS_DIR="$DATADIR/accounts"
+USAGE_DIR="$DATADIR/usage"
+COMPOSE_FILE="$DATADIR/docker-compose.yml"
+
+# ---------------------------------------------------------------- 基础工具
+arch_name() {
+	case "$(uname -m)" in
+		aarch64 | arm64) echo "aarch64" ;;
+		x86_64 | amd64) echo "x86_64" ;;
+		*) echo "" ;;
+	esac
+}
+
+# lan ipaddr 常带掩码（192.168.88.1/24），直接拼 URL 会变成 /24:8788。
+lan_ip() {
+	local ip
+
+	ip=$(uci -q get network.lan.ipaddr)
+	ip=${ip%%/*}
+	[ -n "$ip" ] || ip=$(ip -4 addr show br-lan 2>/dev/null |
+		awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr)
+	echo "${ip:-192.168.1.1}"
+}
+
+host_ip() {
+	# --lan 会把网关暴露到局域网，地址就按 LAN 来
+	lan_ip
+}
+
+task_phase() {
+	[ -s "$TASK_DIR/state" ] && cat "$TASK_DIR/state" 2>/dev/null || echo "idle"
+}
+
+set_phase() {
+	mkdir -p "$TASK_DIR"
+	echo "$1" >"$TASK_DIR/state"
+}
+
+vnum() {
+	echo "${1#v}"
+}
+
+have_docker() {
+	command -v docker >/dev/null 2>&1
+}
+
+docker_live() {
+	have_docker && docker info >/dev/null 2>&1
+}
+
+pkg_mgr() {
+	command -v apk >/dev/null 2>&1 && {
+		echo "apk"
+		return 0
+	}
+	command -v opkg >/dev/null 2>&1 && {
+		echo "opkg"
+		return 0
+	}
+	echo ""
+}
+
+# ---------------------------------------------------------------- 上游版本
+# 走 releases/latest 的 HTTP 重定向，不碰 GitHub API，不受未认证 60 次/小时限制。
+gh_latest_release() {
+	local loc
+
+	loc=$(curl -sI --max-time 15 "https://github.com/$1/releases/latest" 2>/dev/null |
+		tr -d '\r' | sed -n 's#^[Ll]ocation:.*/tag/\(.*\)$#\1#p' | tail -n1)
+
+	case "$loc" in
+		v[0-9]*) echo "$loc" ;;
+		*) echo "" ;;
+	esac
+}
+
+# 只有 tag 没有 release 的项目（Rust 分支现在的状态）走 API，一次点一次请求。
+gh_latest_tag_api() {
+	curl -s --max-time 15 "https://api.github.com/repos/$1/tags?per_page=1" 2>/dev/null |
+		sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' | head -n1
+}
+
+gh_latest_tag() {
+	local t
+
+	t=$(gh_latest_release "$1")
+	[ -n "$t" ] || t=$(gh_latest_tag_api "$1")
+	echo "$t"
+}
+
+cached_latest() {
+	[ -s "$TASK_DIR/latest-$1" ] && cat "$TASK_DIR/latest-$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- 安装状态
+py_present() {
+	[ -x "$PY_INIT" ]
+}
+
+py_running() {
+	local p exe
+
+	for p in /proc/[0-9]*; do
+		[ -r "$p/cmdline" ] || continue
+		exe=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+		case "$exe" in
+			*wb_proxy*) echo 1; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+rs_present() {
+	[ -x "$RUST_BIN" ]
+}
+
+rs_running() {
+	local p exe
+
+	for p in /proc/[0-9]*; do
+		[ -r "$p/cmdline" ] || continue
+		exe=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+		case "$exe" in
+			*wb-backend*) echo 1; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+ct_state() {
+	docker_live || return 1
+	docker inspect --format '{{.State.Status}}' "$CT_NAME" 2>/dev/null
+}
+
+ct_image() {
+	docker_live || return 1
+	docker inspect --format '{{.Config.Image}}' "$CT_NAME" 2>/dev/null
+}
+
+pd_present() {
+	case "$(ct_image)" in
+		*ardeyouxipianyi/workbuddy2api-hub*) return 0 ;;
+	esac
+	return 1
+}
+
+rd_present() {
+	case "$(ct_image)" in
+		*ytjungle666/workbuddy2api-hub*) return 0 ;;
+	esac
+	return 1
+}
+
+ct_running() {
+	[ "$(ct_state)" = "running" ]
+}
+
+port_listening() {
+	netstat -lnt 2>/dev/null | grep -q ":$1 "
+}
+
+# 装完把版本记在数据目录里，跟着数据走：换实现、换目录都不会读错。
+ver_file() {
+	echo "$DATADIR/.wb2api-$1.version"
+}
+
+read_ver() {
+	[ -s "$(ver_file "$1")" ] && cat "$(ver_file "$1")" 2>/dev/null
+}
+
+write_ver() {
+	mkdir -p "$DATADIR" 2>/dev/null
+	echo "$2" >"$(ver_file "$1")"
+}
+
+ver_python() {
+	local v
+
+	py_present || return 0
+
+	v=$(read_ver python)
+	[ -n "$v" ] && {
+		echo "$v"
+		return 0
+	}
+
+	case "$(pkg_mgr)" in
+		apk)
+			apk list -I 2>/dev/null | sed -n 's/^workbuddy2api-\([0-9][^-]*\)-.*/\1/p' | head -n1
+			;;
+		opkg)
+			opkg list-installed 2>/dev/null | awk '$1=="workbuddy2api"{print $3}' | sed 's/-[0-9]*$//' | head -n1
+			;;
+	esac
+}
+
+ver_rust() {
+	local v
+
+	v=$(read_ver rust)
+	[ -n "$v" ] && {
+		echo "$v"
+		return 0
+	}
+	[ -x "$RUST_BIN" ] || return 0
+	"$RUST_BIN" --version 2>/dev/null |
+		sed -n 's/.*[^0-9]\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9.]*\).*/\1/p' | head -n1
+}
+
+# 容器版本从镜像标签取：jar 里最靠得住的就这个。
+ver_ct() {
+	local img
+
+	img=$(ct_image)
+	[ -n "$img" ] || return 0
+	img=${img##*:}
+	[ "$img" = "latest" ] && return 0
+	echo "$(vnum "$img")"
+}
+
+# ---------------------------------------------------------------- 磁盘
+cmd_disks() {
+	df -k 2>/dev/null | awk 'NR>1 && $6 ~ /^\/mnt\// {print "disk=" $6 ":" $4}'
+	return 0
+}
+
+disk_info() {
+	local d_free o_free k_free root
+
+	d_free=$(df -k "$DIR_DEFAULT" 2>/dev/null | awk 'NR==2 {print $4}')
+	[ -n "$d_free" ] || d_free=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+	o_free=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+
+	k_free=""
+	if docker_live; then
+		root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+		[ -n "$root" ] && k_free=$(df -k "$root" 2>/dev/null | awk 'NR==2 {print $4}')
+	fi
+
+	echo "data_free_kb=${d_free:-0}"
+	echo "overlay_free_kb=${o_free:-0}"
+	echo "docker_free_kb=${k_free:-0}"
+}
+
+# ---------------------------------------------------------------- 配置写入
+save_cfg() {
+	# $1=variant $2=port $3=datadir
+	uci -q get workbuddy2api.main >/dev/null 2>&1 || uci -q set workbuddy2api.main=workbuddy2api
+	uci -q set "workbuddy2api.main.variant=$1"
+	uci -q set "workbuddy2api.main.port=$2"
+	uci -q set "workbuddy2api.main.datadir=$3"
+	uci -q set "workbuddy2api.main.host=0.0.0.0"
+	# 这两个是上游 init.d 直接读的字段，指向同一个数据目录，四版共用。
+	uci -q set "workbuddy2api.main.accounts_dir=$3/accounts"
+	uci -q set "workbuddy2api.main.usage_dir=$3/usage"
+	# 老机器上这两个字段可能是别的值，统一成能跑面板的档位
+	uci -q set "workbuddy2api.main.stats_ttl=900"
+	uci -q set "workbuddy2api.main.warm=1"
+	uci -q commit workbuddy2api
+}
+
+# ---------------------------------------------------------------- 状态
+cmd_status() {
+	local kind="" ctimg cts
+	local py_p pd_p rs_p rd_p
+	local py_r pd_r rs_r rd_r
+
+	py_p=0; py_present && py_p=1
+	pd_p=0; pd_present && pd_p=1
+	rs_p=0; rs_present && rs_p=1
+	rd_p=0; rd_present && rd_p=1
+
+	py_r=0; py_running >/dev/null && py_r=1
+	rs_r=0; rs_running >/dev/null && rs_r=1
+	pd_r=0; rd_r=0
+	cts=$(ct_state)
+	if [ "$cts" = "running" ]; then
+		[ "$pd_p" = "1" ] && pd_r=1
+		[ "$rd_p" = "1" ] && rd_r=1
+	fi
+
+	# 谁在跑就是谁；都没跑就按「装了谁」判断（互斥，理论上最多一个）
+	if [ "$py_r" = "1" ]; then
+		kind="python"
+	elif [ "$pd_r" = "1" ]; then
+		kind="python-docker"
+	elif [ "$rs_r" = "1" ]; then
+		kind="rust"
+	elif [ "$rd_r" = "1" ]; then
+		kind="rust-docker"
+	elif [ "$py_p" = "1" ]; then
+		kind="python"
+	elif [ "$pd_p" = "1" ]; then
+		kind="python-docker"
+	elif [ "$rs_p" = "1" ]; then
+		kind="rust"
+	elif [ "$rd_p" = "1" ]; then
+		kind="rust-docker"
+	else
+		kind="none"
+	fi
+
+	echo "kind=$kind"
+	echo "variant=$kind"
+	echo "port=$PORT"
+	echo "datadir=$DATADIR"
+	echo "latest_python=$(cached_latest python)"
+	echo "latest_rust=$(cached_latest rust)"
+	echo "task=$(task_phase)"
+	echo "arch=$(arch_name)"
+	echo "docker=$(docker_live && echo 1 || echo 0)"
+	echo "pkgmgr=$(pkg_mgr)"
+	echo "pkgpython=$(command -v python3 >/dev/null 2>&1 && echo 1 || echo 0)"
+	echo "accounts=$(ls -1 "$ACCOUNTS_DIR"/*.json 2>/dev/null | wc -l)"
+	echo "usagesize_kb=$(du -sk "$USAGE_DIR" 2>/dev/null | awk '{print $1}')"
+
+	disk_info
+
+	echo "python_present=$py_p"
+	echo "python_running=$py_r"
+	echo "python_version=$(ver_python)"
+
+	echo "python_docker_present=$pd_p"
+	echo "python_docker_running=$pd_r"
+	echo "python_docker_version=$([ "$pd_p" = "1" ] && ver_ct)"
+
+	echo "rust_present=$rs_p"
+	echo "rust_running=$rs_r"
+	echo "rust_version=$(ver_rust)"
+
+	echo "rust_docker_present=$rd_p"
+	echo "rust_docker_running=$rd_r"
+	echo "rust_docker_version=$([ "$rd_p" = "1" ] && ver_ct)"
+
+	# 当前这一套的合并视图，页面直接用
+	case "$kind" in
+		none)
+			echo "installed=0"
+			echo "running=0"
+			echo "address=http://$(host_ip):$PORT"
+			echo "version="
+			;;
+		*)
+			echo "installed=1"
+			echo "address=http://$(host_ip):$PORT"
+			echo "version=$(case "$kind" in
+				python) ver_python ;;
+				python-docker) ver_ct ;;
+				rust) ver_rust ;;
+				rust-docker) ver_ct ;;
+			esac)"
+			case "$kind" in
+				python) echo "running=$py_r" ;;
+				python-docker | rust-docker) echo "running=$([ "$cts" = "running" ] && echo 1 || echo 0)" ;;
+				rust) echo "running=$rs_r" ;;
+			esac
+			;;
+	esac
+
+	echo "listening=$(port_listening "$PORT" && echo 1 || echo 0)"
+	return 0
+}
+
+cmd_latest() {
+	local which="$1" p r
+
+	mkdir -p "$TASK_DIR"
+
+	if [ -z "$which" ] || [ "$which" = "all" ] || [ "$which" = "python" ]; then
+		p=$(gh_latest_release "$PY_REPO")
+		if [ -n "$p" ]; then
+			echo "$p" >"$TASK_DIR/latest-python"
+		else
+			p=$(cached_latest python)
+		fi
+		echo "python=$p"
+	fi
+
+	if [ -z "$which" ] || [ "$which" = "all" ] || [ "$which" = "rust" ]; then
+		r=$(gh_latest_tag "$RS_REPO")
+		if [ -n "$r" ]; then
+			echo "$r" >"$TASK_DIR/latest-rust"
+		else
+			r=$(cached_latest rust)
+		fi
+		echo "rust=$r"
+	fi
+
+	return 0
+}
+
+# ---------------------------------------------------------------- 后台任务
+SELF=$(readlink -f "$0" 2>/dev/null)
+[ -n "$SELF" ] || SELF="$0"
+
+spawn_task() {
+	local phase="$1"
+	local label="$2"
+	local log="$TASK_DIR/log"
+
+	shift 2
+
+	mkdir -p "$TASK_DIR"
+	: >"$log"
+	set_phase "$phase"
+
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$SELF" "$@" </dev/null >>"$log" 2>&1 &
+	else
+		("$SELF" "$@" </dev/null >>"$log" 2>&1 &)
+	fi
+
+	echo "已开始：$label"
+	echo "后台执行中，完成后刷新本页；日志：$log"
+	return 0
+}
+
+# ---------------------------------------------------------------- 互斥检查
+# 返回 0 = 可以装；否则打印原因并返回 4
+check_exclusive() {
+	local want="$1"
+
+	if [ "$want" != "python" ] && [ "$(py_present && echo 1)" = "1" ]; then
+		echo "已装「本地·原版」，四选一，请先卸载它。" >&2
+		return 4
+	fi
+	if [ "$want" != "python-docker" ] && pd_present; then
+		echo "已装「容器·原版」，四选一，请先卸载它。" >&2
+		return 4
+	fi
+	if [ "$want" != "rust" ] && [ "$(rs_present && echo 1)" = "1" ]; then
+		echo "已装「本地·Rust」，四选一，请先卸载它。" >&2
+		return 4
+	fi
+	if [ "$want" != "rust-docker" ] && rd_present; then
+		echo "已装「容器·Rust」，四选一，请先卸载它。" >&2
+		return 4
+	fi
+
+	return 0
+}
+
+# ---------------------------------------------------------------- 本地·原版
+worker_python() {
+	local tag="$1" port="$2" dir="$3" ver url tmp f mgr i=0
+
+	mgr=$(pkg_mgr)
+	[ -n "$mgr" ] || {
+		set_phase "error:没有 apk 也没有 opkg，认不出包管理器"
+		return 1
+	}
+
+	[ -n "$tag" ] || {
+		set_phase "error:取不到上游版本号（网络不通？）"
+		return 1
+	}
+	ver=$(vnum "$tag")
+
+	tmp="$dir/.setup"
+	rm -rf "$tmp"
+	mkdir -p "$tmp" || {
+		set_phase "error:无法创建临时目录 $tmp"
+		return 1
+	}
+
+	case "$mgr" in
+		apk)
+			f="$tmp/workbuddy2api-$ver-r1.apk"
+			url="https://github.com/$PY_REPO/releases/download/$tag/workbuddy2api-$ver-r1.apk"
+			;;
+		opkg)
+			f="$tmp/workbuddy2api_${ver}-1_all.ipk"
+			url="https://github.com/$PY_REPO/releases/download/$tag/workbuddy2api_${ver}-1_all.ipk"
+			;;
+	esac
+
+	echo "== 下载 $url"
+	set_phase "downloading:$tag"
+	if ! curl -fL --retry 2 --connect-timeout 15 -o "$f" "$url"; then
+		echo "== 下载失败，试 release 页面里的资产名"
+		set_phase "error:下载失败（$url）"
+		rm -rf "$tmp"
+		return 1
+	fi
+
+	echo "== 安装（$mgr）"
+	set_phase "installing:$tag"
+	case "$mgr" in
+		apk)
+			apk add --allow-untrusted --force-overwrite "$f" 2>&1 || {
+				echo "== apk add 失败：看上面是不是缺依赖或源不通"
+				set_phase "error:apk add 失败，见上方输出"
+				rm -rf "$tmp"
+				return 1
+			}
+			;;
+		opkg)
+			opkg install "$f" 2>&1 || {
+				set_phase "error:opkg install 失败，见上方输出"
+				rm -rf "$tmp"
+				return 1
+			}
+			;;
+	esac
+
+	rm -rf "$tmp"
+
+	echo "== 写配置：端口 $port，数据目录 $dir"
+	save_cfg python "$port" "$dir"
+	write_ver python "$ver"
+
+	[ -x "$PY_INIT" ] || {
+		set_phase "error:装完了但没有 $PY_INIT，包结构不对"
+		return 1
+	}
+
+	"$PY_INIT" enable >/dev/null 2>&1
+	"$PY_INIT" restart >/dev/null 2>&1
+
+	echo "== 等面板起来"
+	set_phase "starting:$tag"
+	while [ $i -lt 40 ]; do
+		port_listening "$port" && break
+		i=$((i + 1))
+		sleep 2
+	done
+
+	if port_listening "$port"; then
+		echo "== 完成：$ver，地址 http://$(host_ip):$port"
+		set_phase "done:$ver"
+		return 0
+	fi
+
+	echo "== 端口没起来，看日志"
+	logread 2>/dev/null | grep -i "workbuddy\|wb-proxy" | tail -n 20
+	set_phase "error:服务没起来，见上方日志"
+	return 1
+}
+
+# ---------------------------------------------------------------- 本地·Rust
+# 上游现在只有 tag 没有 release 资产；有 release 就直接下，没有就从 Docker
+# 镜像里把那个静态 musl 二进制抠出来（镜像里就是 /usr/local/bin/wb-backend）。
+worker_rust() {
+	local tag="$1" port="$2" dir="$3" ver arch url tmp bin i=0
+
+	[ -n "$tag" ] || {
+		set_phase "error:取不到上游版本号（网络不通？）"
+		return 1
+	}
+	ver=$(vnum "$tag")
+	arch=$(arch_name)
+	[ -n "$arch" ] || {
+		set_phase "error:不支持的架构 $(uname -m)"
+		return 1
+	}
+
+	tmp="$dir/.setup"
+	rm -rf "$tmp"
+	mkdir -p "$tmp" || {
+		set_phase "error:无法创建临时目录 $tmp"
+		return 1
+	}
+
+	bin="$tmp/wb-backend"
+	url="https://github.com/$RS_REPO/releases/download/$tag/wb-backend-$ver-linux-$arch"
+
+	echo "== 下载 $url"
+	set_phase "downloading:$tag"
+	if curl -fL --retry 2 --connect-timeout 15 -o "$bin" "$url" 2>/dev/null; then
+		echo "== 从 release 拿到二进制"
+	else
+		echo "== release 里没有这个资产，改从镜像里提取"
+		if ! docker_live; then
+			set_phase "error:release 没资产，且 Docker 没在跑，提取不了二进制"
+			rm -rf "$tmp"
+			return 1
+		fi
+
+		local img="$RS_IMG:${tag}"
+		set_phase "pulling:$img"
+		docker pull "$img" || {
+			set_phase "error:拉不动 $img"
+			rm -rf "$tmp"
+			return 1
+		}
+
+		docker rm -f wb2api-extract >/dev/null 2>&1
+		docker create --name wb2api-extract "$img" >/dev/null 2>&1 || {
+			set_phase "error:创建临时容器失败"
+			rm -rf "$tmp"
+			return 1
+		}
+		docker cp wb2api-extract:/usr/local/bin/wb-backend "$bin" >/dev/null 2>&1
+		docker rm -f wb2api-extract >/dev/null 2>&1
+
+		[ -s "$bin" ] || {
+			set_phase "error:镜像里没找到 /usr/local/bin/wb-backend"
+			rm -rf "$tmp"
+			return 1
+		}
+	fi
+
+	echo "== 安装到 $RUST_BIN"
+	set_phase "installing:$tag"
+	mkdir -p "$(dirname "$RUST_BIN")"
+	cp -f "$bin" "$RUST_BIN" || {
+		set_phase "error:写不进 $RUST_BIN（overlay 满了？）"
+		rm -rf "$tmp"
+		return 1
+	}
+	chmod 755 "$RUST_BIN"
+	rm -rf "$tmp"
+
+	echo "== 写配置：端口 $port，数据目录 $dir"
+	save_cfg rust "$port" "$dir"
+	write_ver rust "$ver"
+
+	[ -x "$RS_INIT" ] || {
+		set_phase "error:缺少 $RS_INIT（luci-app-workbuddy2api 没装好？）"
+		return 1
+	}
+
+	"$RS_INIT" enable >/dev/null 2>&1
+	"$RS_INIT" restart >/dev/null 2>&1
+
+	echo "== 等面板起来"
+	set_phase "starting:$tag"
+	while [ $i -lt 40 ]; do
+		port_listening "$port" && break
+		i=$((i + 1))
+		sleep 2
+	done
+
+	if port_listening "$port"; then
+		echo "== 完成：$ver，地址 http://$(host_ip):$port"
+		set_phase "done:$ver"
+		return 0
+	fi
+
+	set_phase "error:服务没起来，点「查看日志」看输出"
+	return 1
+}
+
+# ---------------------------------------------------------------- 容器
+compose_bin() {
+	if docker_live && docker compose version >/dev/null 2>&1; then
+		echo "docker compose"
+		return 0
+	fi
+	command -v docker-compose >/dev/null 2>&1 && {
+		echo "docker-compose"
+		return 0
+	}
+	return 1
+}
+
+compose() {
+	local bin
+	bin=$(compose_bin) || return 1
+	# shellcheck disable=SC2086
+	$bin -p "$CT_NAME" -f "$COMPOSE_FILE" "$@"
+}
+
+yaml_q() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+compose_write() {
+	local variant="$1" tag="$2" port="$3" dir="$4" tz
+
+	tz=$(uci -q get system.@system[0].zonename)
+	[ -n "$tz" ] || tz="Asia/Shanghai"
+
+	mkdir -p "$dir/accounts" "$dir/usage" || return 1
+
+	{
+		echo "# 由 luci-app-workbuddy2api 生成，重新安装/更新会覆盖。"
+		echo "# 四套实现共用 $dir 下的 accounts/ 与 usage/，换实现不丢数据。"
+		echo "services:"
+		echo "  $CT_NAME:"
+		if [ "$variant" = "python-docker" ]; then
+			echo "    image: $(yaml_q "$PY_IMG:${tag:-latest}")"
+		else
+			echo "    image: $(yaml_q "$RS_IMG:${tag:-latest}")"
+		fi
+		echo "    container_name: $CT_NAME"
+		echo "    restart: unless-stopped"
+		echo "    # host 网络：容器内端口就是宿主端口，局域网直连，不用管桥接转发"
+		echo "    network_mode: host"
+		echo "    environment:"
+		echo "      TZ: $(yaml_q "$tz")"
+		if [ "$variant" = "python-docker" ]; then
+			echo "      HOST: '0.0.0.0'"
+			echo "      PORT: $(yaml_q "$port")"
+			echo "      # 面板每 5 秒轮询一次，缓存过期就要全量重扫 usage.jsonl，"
+			echo "      # 在这台路由器上要十几秒。900 秒是能正常用的下限。"
+			echo "      WB_STATS_TTL: '900'"
+			echo "      WB_COUNT_TTL: '900'"
+			echo "    volumes:"
+			echo "      - $(yaml_q "$dir/accounts:/app/accounts")"
+			echo "      - $(yaml_q "$dir/usage:/app/usage")"
+			echo "      - $(yaml_q "$dir/subbridge-data:/app/subbridge-data")"
+		else
+			echo "      # 面板自更新换的是容器里的文件，镜像重建就回去，关掉走页面更新"
+			echo "      WB_UPDATE_INSTALL_ENABLED: '0'"
+			echo "    command:"
+			echo "      - '--host'"
+			echo "      - '0.0.0.0'"
+			echo "      - '--lan'"
+			echo "      - '--port'"
+			echo "      - $(yaml_q "$port")"
+			echo "      - '--accounts-dir'"
+			echo "      - '/data/accounts'"
+			echo "      - '--usage-dir'"
+			echo "      - '/data/usage'"
+			echo "    volumes:"
+			echo "      - $(yaml_q "$dir:/data")"
+		fi
+	} >"$COMPOSE_FILE" || return 1
+
+	return 0
+}
+
+worker_ct_up() {
+	local variant="$1" tag="$2" port="$3" dir="$4" i=0 img
+
+	img=$([ "$variant" = "python-docker" ] && echo "$PY_IMG:$tag" || echo "$RS_IMG:$tag")
+
+	if compose_bin >/dev/null 2>&1; then
+		echo "== compose pull $img"
+		set_phase "pulling:$tag"
+		compose pull || echo "== pull 有告警，继续（本地可能已有该镜像）"
+
+		echo "== compose up -d"
+		set_phase "starting:$tag"
+		compose up -d || {
+			set_phase "error:compose up 失败，看上面的输出"
+			return 1
+		}
+	else
+		echo "== 没有 docker compose，先拉镜像再用 docker run"
+		set_phase "pulling:$tag"
+		docker pull "$img" || {
+			set_phase "error:拉不动 $img"
+			return 1
+		}
+		docker rm -f "$CT_NAME" >/dev/null 2>&1
+		set -- docker run -d --name "$CT_NAME" --restart unless-stopped \
+			--network host -e "TZ=$(uci -q get system.@system[0].zonename)"
+		if [ "$variant" = "python-docker" ]; then
+			set -- "$@" -e "HOST=0.0.0.0" -e "PORT=$port" \
+				-e WB_STATS_TTL=900 -e WB_COUNT_TTL=900 \
+				-v "$dir/accounts:/app/accounts" -v "$dir/usage:/app/usage"
+		else
+			set -- "$@" -e WB_UPDATE_INSTALL_ENABLED=0 -v "$dir:/data" \
+				"$img" --host 0.0.0.0 --lan --port "$port" \
+				--accounts-dir /data/accounts --usage-dir /data/usage
+		fi
+		[ "$variant" = "python-docker" ] && set -- "$@" "$img"
+		"$@" || {
+			set_phase "error:docker run 失败，看上面的输出"
+			return 1
+		}
+	fi
+
+	echo "== 等面板起来"
+	set_phase "starting:$tag"
+	while [ $i -lt 60 ]; do
+		ct_running && port_listening "$port" && break
+		i=$((i + 1))
+		sleep 3
+	done
+
+	if ! ct_running; then
+		echo "== 容器没起来"
+		docker logs --tail 40 "$CT_NAME" 2>&1
+		set_phase "error:容器没起来，看上面的日志"
+		return 1
+	fi
+
+	echo "== 完成，地址 http://$(host_ip):$port"
+	set_phase "done:$tag"
+	return 0
+}
+
+# ---------------------------------------------------------------- 安装入口
+cmd_install() {
+	local variant="$1" port="$2" dir="$3" tag="$4"
+	local overlay_kb
+
+	[ -n "$port" ] || port="$PORT"
+	[ -n "$dir" ] || dir="$DATADIR"
+
+	case "$dir" in
+		/mnt/*) ;;
+		*)
+			echo "数据目录必须在 /mnt 下（当前：$dir）" >&2
+			echo "账号凭据与用量日志都写这里；放 overlay 会写满 flash，刷机也会丢。" >&2
+			return 2
+			;;
+	esac
+
+	case "$port" in
+		'' | *[!0-9]*)
+			echo "端口必须是数字（当前：$port）" >&2
+			return 1
+			;;
+	esac
+
+	check_exclusive "$variant" || return 4
+
+	case "$variant" in
+		python | python-docker | rust | rust-docker) ;;
+		*)
+			echo "未知的安装方式：$variant" >&2
+			return 1
+			;;
+	esac
+
+	mkdir -p "$dir/accounts" "$dir/usage" || {
+		echo "无法创建 $dir" >&2
+		return 1
+	}
+	chmod 700 "$dir/accounts" 2>/dev/null
+
+	case "$variant" in
+		python)
+			overlay_kb=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+			if [ -n "$overlay_kb" ] && [ "$overlay_kb" -lt 102400 ]; then
+				echo "overlay 剩余不足 100MB（当前 $((overlay_kb / 1024))MB）。" >&2
+				echo "本地·原版会连带装 python3 等约 15MB 依赖。" >&2
+				return 3
+			fi
+			[ -n "$tag" ] || tag=$(gh_latest_release "$PY_REPO")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号（GitHub 不通？）" >&2
+				return 1
+			}
+			save_cfg python "$port" "$dir"
+			spawn_task "downloading:$tag" "安装本地·原版 $tag" \
+				_worker_python "$tag" "$port" "$dir"
+			;;
+		rust)
+			[ -n "$tag" ] || tag=$(gh_latest_tag "$RS_REPO")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号（GitHub 不通？）" >&2
+				return 1
+			}
+			save_cfg rust "$port" "$dir"
+			spawn_task "downloading:$tag" "安装本地·Rust $tag" \
+				_worker_rust "$tag" "$port" "$dir"
+			;;
+		python-docker)
+			docker_live || {
+				echo "Docker 没在跑，容器版装不了。" >&2
+				return 1
+			}
+			[ -n "$tag" ] || tag=$(gh_latest_release "$PY_REPO")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号（GitHub 不通？）" >&2
+				return 1
+			}
+			compose_write python-docker "$tag" "$port" "$dir" || {
+				echo "写不了 $COMPOSE_FILE" >&2
+				return 1
+			}
+			save_cfg python-docker "$port" "$dir"
+			spawn_task "pulling:$tag" "安装容器·原版 $tag" \
+				_worker_ct_up python-docker "$tag" "$port" "$dir"
+			;;
+		rust-docker)
+			docker_live || {
+				echo "Docker 没在跑，容器版装不了。" >&2
+				return 1
+			}
+			[ -n "$tag" ] || tag=$(gh_latest_tag "$RS_REPO")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号（GitHub 不通？）" >&2
+				return 1
+			}
+			# 镜像标签不带 v（2.0.1.2），release tag 带 v（v2.0.1.2）
+			tag=$(vnum "$tag")
+			compose_write rust-docker "$tag" "$port" "$dir" || {
+				echo "写不了 $COMPOSE_FILE" >&2
+				return 1
+			}
+			save_cfg rust-docker "$port" "$dir"
+			spawn_task "pulling:$tag" "安装容器·Rust $tag" \
+				_worker_ct_up rust-docker "$tag" "$port" "$dir"
+			;;
+	esac
+
+	return 0
+}
+
+# ---------------------------------------------------------------- 更新
+cmd_update() {
+	local variant="$1" tag
+
+	[ -n "$variant" ] || variant=$(cmd_status | sed -n 's/^kind=//p')
+	case "$variant" in
+		python)
+			py_present || {
+				echo "没装本地·原版" >&2
+				return 1
+			}
+			tag=$(gh_latest_release "$PY_REPO")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号" >&2
+				return 1
+			}
+			if [ "$(vnum "$tag")" = "$(ver_python)" ]; then
+				echo "已经是最新版：$(ver_python)"
+				return 0
+			fi
+			spawn_task "downloading:$tag" "升级本地·原版到 $tag" \
+				_worker_python "$tag" "$PORT" "$DATADIR"
+			;;
+		rust)
+			rs_present || {
+				echo "没装本地·Rust" >&2
+				return 1
+			}
+			tag=$(gh_latest_tag "$RS_REPO")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号" >&2
+				return 1
+			}
+			if [ "$(vnum "$tag")" = "$(ver_rust)" ]; then
+				echo "已经是最新版：$(ver_rust)"
+				return 0
+			fi
+			spawn_task "downloading:$tag" "升级本地·Rust 到 $tag" \
+				_worker_rust "$tag" "$PORT" "$DATADIR"
+			;;
+		python-docker)
+			pd_present || {
+				echo "没装容器·原版" >&2
+				return 1
+			}
+			tag=$(gh_latest_release "$PY_REPO")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号" >&2
+				return 1
+			}
+			compose_write python-docker "$tag" "$PORT" "$DATADIR"
+			spawn_task "pulling:$tag" "升级容器·原版到 $tag" \
+				_worker_ct_up python-docker "$tag" "$PORT" "$DATADIR"
+			;;
+		rust-docker)
+			rd_present || {
+				echo "没装容器·Rust" >&2
+				return 1
+			}
+			tag=$(vnum "$(gh_latest_tag "$RS_REPO")")
+			[ -n "$tag" ] || {
+				echo "取不到上游版本号" >&2
+				return 1
+			}
+			compose_write rust-docker "$tag" "$PORT" "$DATADIR"
+			spawn_task "pulling:$tag" "升级容器·Rust 到 $tag" \
+				_worker_ct_up rust-docker "$tag" "$PORT" "$DATADIR"
+			;;
+		*)
+			echo "没有安装任何一套" >&2
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+# ---------------------------------------------------------------- 生命周期
+cmd_lifecycle() {
+	local variant="$1" act="$2"
+
+	case "$variant" in
+		python)
+			[ -x "$PY_INIT" ] || {
+				echo "没装本地·原版" >&2
+				return 1
+			}
+			[ "$act" = "start" ] && "$PY_INIT" enable >/dev/null 2>&1
+			"$PY_INIT" "$act" 2>&1
+			;;
+		rust)
+			[ -x "$RS_INIT" ] || {
+				echo "没装本地·Rust" >&2
+				return 1
+			}
+			[ "$act" = "start" ] && "$RS_INIT" enable >/dev/null 2>&1
+			"$RS_INIT" "$act" 2>&1
+			;;
+		python-docker | rust-docker)
+			ct_running >/dev/null 2>&1 || [ -n "$(ct_state)" ] || {
+				echo "没有 wb-proxy 容器" >&2
+				return 1
+			}
+			if compose_bin >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
+				compose "$act" 2>&1 || docker "$act" "$CT_NAME" 2>&1
+			else
+				docker "$act" "$CT_NAME" 2>&1
+			fi
+			;;
+		*)
+			echo "未知的安装方式：$variant" >&2
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+cmd_remove() {
+	local variant="$1" purge="$2" dir
+
+	dir="$DATADIR"
+
+	case "$variant" in
+		python)
+			[ -x "$PY_INIT" ] && "$PY_INIT" stop >/dev/null 2>&1
+			[ -x "$PY_INIT" ] && "$PY_INIT" disable >/dev/null 2>&1
+			case "$(pkg_mgr)" in
+				apk) apk del workbuddy2api 2>&1 ;;
+				opkg) opkg remove workbuddy2api 2>&1 ;;
+			esac
+			rm -f "$(ver_file python)"
+			;;
+		rust)
+			[ -x "$RS_INIT" ] && "$RS_INIT" stop >/dev/null 2>&1
+			[ -x "$RS_INIT" ] && "$RS_INIT" disable >/dev/null 2>&1
+			rm -f "$RUST_BIN" "$(ver_file rust)"
+			;;
+		python-docker | rust-docker)
+			if compose_bin >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
+				compose down >/dev/null 2>&1
+			fi
+			docker rm -f "$CT_NAME" >/dev/null 2>&1
+			rm -f "$COMPOSE_FILE"
+			;;
+		*)
+			echo "未知的安装方式：$variant" >&2
+			return 1
+			;;
+	esac
+
+	if [ "$purge" = "purge" ]; then
+		rm -rf "$dir/accounts" "$dir/usage" "$dir/subbridge-data"
+		rm -f "$dir"/.wb2api-*.version
+		echo "已卸载并删除数据：$dir"
+	else
+		echo "已卸载，数据保留在：$dir"
+	fi
+
+	return 0
+}
+
+cmd_logs() {
+	local variant="$1"
+
+	if [ -s "$TASK_DIR/log" ]; then
+		echo "== 任务日志 =="
+		tail -n 40 "$TASK_DIR/log"
+		echo
+	fi
+
+	case "$variant" in
+		python | rust)
+			echo "== 服务日志 =="
+			logread 2>/dev/null | grep -iE "workbuddy|wb-proxy|wb-backend" | tail -n 40
+			;;
+		*)
+			echo "== 容器日志 =="
+			docker logs --tail 60 "$CT_NAME" 2>&1
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------- 入口
+case "${1:-}" in
+	status) cmd_status ;;
+	latest) cmd_latest "${2:-all}" ;;
+	disks) cmd_disks ;;
+	install) cmd_install "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+	update) cmd_update "${2:-}" ;;
+	start | stop | restart) cmd_lifecycle "${2:-}" "$1" ;;
+	remove) cmd_remove "${2:-}" "${3:-}" ;;
+	logs) cmd_logs "${2:-}" ;;
+	_worker_python) shift; worker_python "$@" ;;
+	_worker_rust) shift; worker_rust "$@" ;;
+	_worker_ct_up) shift; worker_ct_up "$@" ;;
+	*)
+		cat >&2 <<-EOF
+			用法：workbuddy2api-ctl <命令>
+
+			  status                    四套的完整状态
+			  latest [python|rust|all]  查上游最新版本
+			  disks                     /mnt 下的数据目录候选
+
+			  install <安装方式> [端口] [数据目录] [版本]
+			    本地·原版    python
+			    容器·原版    python-docker
+			    本地·Rust    rust
+			    容器·Rust    rust-docker
+
+			  update <安装方式>
+			  start|stop|restart <安装方式>
+			  remove <安装方式> [purge]
+			  logs <安装方式>
+		EOF
+		exit 1
+		;;
+esac
+
+exit $?
